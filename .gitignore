@@ -1,0 +1,11 @@
+# Dependencies — platform-specific (Puppeteer's bundled Chromium
+# differs per OS), never portable between machines. Always run a
+# fresh `npm install` on whatever machine actually runs this.
+node_modules/
+
+# Secrets — never committed, ever.
+.env
+
+# Generated at runtime, never committed:
+logs/   
+data/                
