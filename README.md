@@ -381,13 +381,26 @@ Nothing here reshapes the taxpayer JSON — see the design note below.
   healthy. Evaluate on whole-CAPTCHA accuracy (all 6 digits correct), not
   just per-character accuracy — a single wrong digit still fails the
   lookup.
-- **Level 6 — Hybrid solver.** Try our own model first; fall back to
-  2Captcha on low confidence, and keep feeding those fallback cases back
-  into the dataset. `captcha/solver.js` is the only file that would need
-  a sibling module (e.g. `captcha/own-model-solver.js`) and a small
-  branch in `main.js` to support this — nothing else changes.
+- **Level 6 — Hybrid solver. Built, pending a live-portal validation
+  pass.** Our own trained model (`ml-service/` — a standalone FastAPI
+  process serving the CRNN+CTC checkpoint) is tried first via
+  `captcha/own-model-solver.js`. A prediction is only trusted pre-submit
+  if it's exactly 6 digits and clears both confidence thresholds
+  (`config.ownModelSolver.confidenceThreshold`); otherwise — or if the
+  portal itself rejects it (`SWEB_9000`, the confirmed wrong-CAPTCHA
+  code) — a fresh CAPTCHA is recaptured and retried, up to
+  `config.ownModelSolver.maxRetries` times, before falling back to
+  2Captcha. Every attempt that isn't a clean first-try success is logged
+  to `storage/captcha-failure-store.js` (image + full confidence
+  breakdown), and successful/rejected own-model attempts feed back into
+  the Level 3 dataset store with `portalConfirmed`/`solverConfidence` set
+  accordingly. `pipeline/pipeline.js`'s `solveAndSubmitWithRetries` is
+  where all of this is sequenced. See `ml-service/`'s own module
+  docstrings for the serving side. **Still open:** the confidence
+  thresholds are starting values, not calibrated ones, and this hasn't
+  yet been run against the live portal end-to-end.
 
-Levels 4-6 aren't built yet. The Level 3 dataset store is live and wired
+Levels 4-5 aren't built yet. The Level 3 dataset store is live and wired
 into `pipeline/pipeline.js` (so both `main.js` and `server.js` feed it),
 but stays a strict no-op until `DATASET_COLLECTION_ENABLED=true` is set,
 per the "don't rush into training" plan.
@@ -399,24 +412,20 @@ per the "don't rush into training" plan.
   (server-to-server, not directly from browser JS on another site). See
   the Authentication section above for the one case where that would
   need to change.
-- **`browser.launchOptions.headless` is still `false`** (carried over
-  from the original `scrapper.js`, written for a one-off interactive
-  run). That's fine for the CLI on your own machine, but a server is
-  meant to run unattended — each `POST /api/taxpayer` will currently pop
-  open a visible Chromium window. Worth switching to `headless: true` in
-  `config/config.js` (or a new `HEADLESS` env flag) once you're running
-  the server for real rather than watching it work.
+- **`browser.launchOptions.headless` now defaults to `true`**
+  (`config/config.js`: `process.env.HEADLESS !== "false"`) — this used to
+  default to `false` (carried over from the original `scrapper.js`,
+  written for a one-off interactive run) but that's since been switched.
+  Set `HEADLESS=false` in `.env` when you deliberately want to watch a
+  run (e.g. while validating the own-model CAPTCHA path above); leave it
+  unset for normal/server use.
 - **No rate limiting.** A valid API key can currently fire lookups back
   to back through the queue, each one a paid 2Captcha call. Not an issue
   for one trusted client (Hi Life Nx); worth adding if more keys get
   handed out.
-- **There is no `ml/` folder in this project.** Everything under
-  `data/` (including the whole dataset) is already gitignored via
-  the blanket `data/` line — nothing dataset-related needs separate
-  exclusion. If a model-training folder (e.g. `ml/` with notebooks/
-  checkpoints, for training on a GPU box) gets added later as its
-  own thing alongside this scraper, it's real code/notebooks, not
-  generated data — it shouldn't be blanket-ignored the way `data/`
-  is, just add specific rules for its own generated artifacts
-  (`__pycache__/`, `.ipynb_checkpoints/`, model checkpoint files,
-  a Python venv) when that folder actually exists.
+- **`ml-service/` is real code, not generated data.** Unlike `data/`
+  (blanket-ignored), `ml-service/*.py` is tracked normally in git — only
+  its own generated/large artifacts are excluded: `ml-service/checkpoint/`
+  (the ~150MB `best_model.pt`, synced onto each machine directly rather
+  than committed) and the usual Python venv/`__pycache__` patterns. See
+  `.gitignore` for the exact rules.

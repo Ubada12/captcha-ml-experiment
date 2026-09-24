@@ -1,0 +1,17 @@
+# ml-service — Python dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# torch/torchvision versions aren't pinned tightly here since the
+# model was trained and exported with standard state_dict weights
+# (no version-specific pickled classes) — any reasonably recent
+# torch/torchvision pair that can load a ResNet-18 works. Pin exact
+# versions once this is deployed somewhere version drift could bite.
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+torch>=2.2
+torchvision>=0.17
+pillow>=10.0
+pydantic>=2.0

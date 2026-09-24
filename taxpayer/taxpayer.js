@@ -64,8 +64,17 @@ async function enterCaptchaSolution(page, solutionText) {
 // this is what actually tells success from failure. Known codes get a
 // human-readable reason; anything unrecognized still gets caught and
 // surfaces its raw errorCode/message so it's obvious in the logs.
+//
+// SWEB_9000 was confirmed from real production logs (logs/application.log)
+// paired with the on-page error text "Enter valid letters shown in the
+// image below" — this is the actual wrong-CAPTCHA rejection signature on
+// this portal, distinct from SWEB_9035 (a bad GSTIN). It's the ground-
+// truth signal the own-model retry loop (pipeline.js) is built around:
+// everything else (format checks, model confidence) is a heuristic that
+// runs before we actually know; this is the one answer that's certain.
 const KNOWN_PORTAL_ERROR_CODES = {
-    SWEB_9035: "The GSTIN/UIN entered is invalid."
+    SWEB_9035: "The GSTIN/UIN entered is invalid.",
+    SWEB_9000: "The CAPTCHA entered is invalid."
 };
 
 function assertSuccessfulTaxpayerPayload(data) {
@@ -85,10 +94,18 @@ function assertSuccessfulTaxpayerPayload(data) {
 
     const reason = message || KNOWN_PORTAL_ERROR_CODES[errorCode] || "the portal rejected the lookup.";
 
-    throw new Error(
+    const error = new Error(
         `[Network] GST portal returned an error instead of taxpayer data: ${reason}` +
         (errorCode ? ` [errorCode=${errorCode}]` : "")
     );
+
+    // A typed flag, not a message-string match — pipeline.js's retry
+    // loop branches on error.isCaptchaRejection directly, so it never
+    // has to parse human-readable text to decide what happened.
+    error.isCaptchaRejection = (errorCode === "SWEB_9000");
+    error.portalErrorCode = errorCode;
+
+    throw error;
 }
 
 function waitForTaxpayerResponse(page) {

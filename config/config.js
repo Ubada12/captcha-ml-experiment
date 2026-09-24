@@ -15,6 +15,27 @@ const path = require("path");
 
 const projectRoot = path.resolve(__dirname, "..");
 
+// ------------------------------------------------------
+// `process.env.X || fallback` silently discards an explicit,
+// deliberately-chosen "0" — parseInt("0") === 0, and 0 is falsy in
+// JS, so `0 || 2` evaluates to 2 instead of the 0 the operator
+// actually asked for. That's a real footgun for knobs where 0 is a
+// meaningful value (e.g. OWN_MODEL_MAX_RETRIES=0 meaning "don't
+// retry the own model at all, fall back to 2Captcha after the first
+// miss", or a confidence threshold of 0 meaning "always trust it").
+// These two helpers fall back only when the env var is genuinely
+// unset/unparseable (NaN), never when it parses to a valid 0.
+// ------------------------------------------------------
+function intFromEnv(value, fallback) {
+    const parsed = parseInt(value, 10);
+    return Number.isNaN(parsed) ? fallback : parsed;
+}
+
+function floatFromEnv(value, fallback) {
+    const parsed = parseFloat(value);
+    return Number.isNaN(parsed) ? fallback : parsed;
+}
+
 module.exports = {
 
     // ------------------------------------------------------
@@ -48,13 +69,79 @@ module.exports = {
     },
 
     // ------------------------------------------------------
-    // 2Captcha solver settings
+    // 2Captcha solver settings — unchanged. Still required
+    // whenever the own-model fallback path (below) can fire.
     // ------------------------------------------------------
     captchaSolver: {
         apiKey: process.env.TWOCAPTCHA_API_KEY,
         expectedLength: 6,
         maxPollAttempts: 24,
         pollIntervalMs: 5000
+    },
+
+    // ------------------------------------------------------
+    // Own-trained CAPTCHA model settings (Level 6 of the
+    // roadmap: try our own model first, fall back to 2Captcha
+    // on low confidence or a confirmed-wrong portal rejection).
+    //
+    // Talks to ml-service (a standalone FastAPI process — see
+    // ml-service/serve.py) over plain HTTP. That service is not
+    // started by this app; run it separately (see ml-service's
+    // own docs) before enabling this.
+    // ------------------------------------------------------
+    ownModelSolver: {
+
+        serviceUrl: process.env.OWN_MODEL_SERVICE_URL || "http://127.0.0.1:8001",
+
+        // Local inference should be near-instant. A short timeout
+        // here means a hung/unreachable ml-service is detected and
+        // routed around (see fallbackTo2CaptchaEnabled) in seconds,
+        // not by hanging the whole lookup.
+        //
+        // Careful with 0 here: this is passed straight to axios as
+        // `timeout`, and axios treats 0 as "no timeout at all" (waits
+        // forever), not "time out immediately" — the opposite of what
+        // 0 usually implies for the other knobs in this block.
+        requestTimeoutMs: intFromEnv(process.env.OWN_MODEL_REQUEST_TIMEOUT_MS, 5000),
+
+        // How many times to retry OUR OWN model — each retry against
+        // a freshly recaptured CAPTCHA image, since the portal issues
+        // a new image after every rejected attempt — before giving up
+        // on it for this lookup. 2 means up to 3 total own-model
+        // attempts (the first try plus 2 retries). 0 is a valid,
+        // deliberate choice too ("try our model exactly once, then go
+        // straight to 2Captcha") — see intFromEnv's comment above for
+        // why this can't just be `parseInt(...) || 2`.
+        maxRetries: intFromEnv(process.env.OWN_MODEL_MAX_RETRIES, 2),
+
+        // A prediction is only trusted pre-submit if it's exactly 6
+        // digits AND clears both confidence thresholds. minConfidence
+        // matters more than avgConfidence here: a single wrong digit
+        // fails the whole lookup, so one weak character should count
+        // as low confidence overall even if the other five are strong.
+        //
+        // These are STARTING VALUES, not calibrated ones — see the
+        // ML_Captcha_Integration_Plan.md "Open item" section. Revisit
+        // once the full labeled dataset can be scored end-to-end.
+        confidenceThreshold: {
+            avg: floatFromEnv(process.env.OWN_MODEL_AVG_CONFIDENCE_THRESHOLD, 0.90),
+            min: floatFromEnv(process.env.OWN_MODEL_MIN_CONFIDENCE_THRESHOLD, 0.60)
+        },
+
+        // Master switch. false = own-model-solver.js is never called
+        // at all and every lookup goes straight to 2Captcha, exactly
+        // like before this feature existed — an instant rollback
+        // lever if the own-model path ever needs to be pulled out of
+        // the live path without a code change.
+        enabled: process.env.OWN_MODEL_SOLVER_ENABLED !== "false",
+
+        // Separate from `enabled` on purpose: this controls only
+        // whether exhausting maxRetries falls back to 2Captcha, or
+        // just fails the lookup outright. Kept as its own switch so
+        // "always use our model, never spend a 2Captcha credit" is
+        // also a valid configuration, not just on/off for the whole
+        // own-model feature.
+        fallbackTo2CaptchaEnabled: process.env.OWN_MODEL_FALLBACK_ENABLED !== "false"
     },
 
     // ------------------------------------------------------
@@ -183,6 +270,15 @@ module.exports = {
         captchasDir: path.join(projectRoot, "data", "captchas"),
         failuresDir: path.join(projectRoot, "data", "failures"),
         resultsDir: path.join(projectRoot, "data", "results"),
+
+        // Own-model CAPTCHA failure forensics (storage/captcha-failure-store.js).
+        // Deliberately separate from failuresDir above (that one is generic
+        // workflow-failure screenshots) and from the dataset dir below (that
+        // one is gated training material) — this is always-on operational
+        // evidence specifically about CAPTCHA prediction attempts.
+        captchaFailuresDir: path.join(projectRoot, "data", "captcha-failures"),
+        captchaFailuresImagesDir: path.join(projectRoot, "data", "captcha-failures", "images"),
+        captchaFailuresLogFile: path.join(projectRoot, "data", "captcha-failures", "failures.jsonl"),
 
         datasetDir: path.join(projectRoot, "data", "dataset"),
         // Images are further partitioned by date at write time (see
