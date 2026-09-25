@@ -80,3 +80,12 @@ coverage/
 htmlcov/
 *.tmp
 .tmp/
+
+# Documentation
+docs/
+
+# Markdown files
+*.md
+
+# Keep README
+!README.md
