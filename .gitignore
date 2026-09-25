@@ -26,7 +26,7 @@ ml-service/env/
 .env.*
 # ...except a template that deliberately holds no real values —
 # uncomment/add one if this project ever ships an example file:
-# !.env.example
+!.env.example
 *.pem
 *.key
 *.p12

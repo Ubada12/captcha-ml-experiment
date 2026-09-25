@@ -55,7 +55,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from decode import decode_with_confidence
-from model import CaptchaCRNN, count_parameters
+from model import IMAGE_HEIGHT, IMAGE_WIDTH, CaptchaCRNN, count_parameters
 from preprocess import InvalidImageError, prepare_input
 
 # ============================================================
@@ -99,6 +99,23 @@ CHECKPOINT_PATH = SERVICE_DIR / "checkpoint" / "best_model.pt"
 # ============================================================
 # Model loading — happens once, at import time, so the very
 # first request doesn't pay a multi-second cold-start cost.
+#
+# Loading the checkpoint's weights into memory is only half of
+# that promise, though: it does NOT warm up the execution path
+# itself. A freshly loaded model's very first forward pass still
+# does one-time work under the hood — picking CPU kernel
+# implementations for the conv/BatchNorm layers, first-touch
+# allocation for every intermediate tensor, cuDNN algorithm
+# selection on GPU — that every later forward pass skips. Left
+# alone, that cost lands on whichever real CAPTCHA happens to be
+# the first one solved after a (re)start. In production this
+# showed up as the Node side's axios call timing out (5000ms) on
+# attempt 1, immediately followed by fast (tens of ms), confident
+# predictions on every attempt after it — the signature of a
+# one-time warm-up cost, not a broken model or a flaky service.
+# _warm_up() below pays that cost here, at startup, against
+# throwaway data, so the first REAL /predict call is exactly as
+# fast as every other one.
 # ============================================================
 
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -139,12 +156,44 @@ def _load_model():
     return model
 
 
+def _warm_up(model):
+    """
+    Runs one dummy forward pass through the model before the service
+    starts accepting real traffic. See the comment above this
+    section for why this is needed even after _load_model() has
+    already put the weights in memory.
+
+    Deliberately uses a zero tensor of the exact shape prepare_input()
+    would produce (1, 3, IMAGE_HEIGHT, IMAGE_WIDTH) — its content is
+    irrelevant, only the shape matters, since the point is to exercise
+    every layer once, not to get a meaningful prediction.
+    """
+    dummy_input = torch.zeros(1, 3, IMAGE_HEIGHT, IMAGE_WIDTH, device=_device)
+
+    start_time = time.monotonic()
+    with torch.no_grad():
+        model(dummy_input)
+    warm_up_ms = (time.monotonic() - start_time) * 1000
+
+    logger.info(f"Model warm-up forward pass complete in {warm_up_ms:.1f}ms.")
+
+
 try:
-    _model = _load_model()
+    _loaded_model = _load_model()
+    _warm_up(_loaded_model)
+    # Only published to the module-level _model (and therefore only
+    # able to serve /predict) once loading AND warm-up have both
+    # succeeded — if warm-up itself throws, that's a real sign the
+    # model can't run a forward pass at all, and /predict would fail
+    # on the very next real request anyway. Failing closed here means
+    # an operator sees it in the startup logs immediately instead of
+    # it surfacing later as a mysteriously-failing live CAPTCHA.
+    _model = _loaded_model
     logger.info("ml-service is ready to accept /predict requests.")
-except Exception as error:  # noqa: BLE001 — deliberately broad: we want /health to report ANY load failure
+except Exception as error:  # noqa: BLE001 — deliberately broad: we want /health to report ANY load/warm-up failure
+    _model = None
     _model_load_error = str(error)
-    logger.error(f"Model failed to load at startup: {error}")
+    logger.error(f"Model failed to load or warm up at startup: {error}")
     logger.error("The service will start, but /predict will return 503 until this is fixed.")
 
 

@@ -32,6 +32,21 @@
  *   node scripts/collect-dataset.js --count=50 --delay-ms=5000
  *   npm run collect-dataset -- --count=25
  *
+ * IMPORTANT — cache-aware POST /api/taxpayer:
+ *   POST /api/taxpayer now serves a fresh-enough cached result
+ *   instead of always running a live lookup (see
+ *   server/taxpayer-cache-gateway.js and
+ *   docs/gstin-cache-architecture-plan.md). This script's whole
+ *   point is racking up MANY INDEPENDENT LIVE SOLVES of the same
+ *   GSTIN, so every request below explicitly sends
+ *   `maxCacheAgeMs: 0` — "nothing cached is ever fresh enough" —
+ *   to force a real lookup every time, exactly like every request
+ *   this script made before the cache existed. Do not remove that
+ *   without understanding why it's there: without it, attempt 2
+ *   onward would just return attempt 1's cached result instantly,
+ *   with no error at all, and dataset collection would silently
+ *   stop collecting anything.
+ *
  * Flags (all optional):
  *   --count=100                     how many SUCCESSFUL solves to
  *                                    collect (keeps going past
@@ -126,7 +141,10 @@ async function attemptLookup(attemptNumber) {
                 "Content-Type": "application/json",
                 "X-API-Key": API_KEY
             },
-            body: JSON.stringify({ gstin: GSTIN })
+            // maxCacheAgeMs: 0 forces a live lookup every time — see
+            // the "IMPORTANT — cache-aware POST /api/taxpayer" note
+            // in this file's header comment for why this must stay.
+            body: JSON.stringify({ gstin: GSTIN, maxCacheAgeMs: 0 })
         });
     } catch (error) {
         const elapsed = formatDuration(Date.now() - startedAt);

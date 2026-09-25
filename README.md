@@ -34,6 +34,10 @@ server/
   auth.js                 X-API-Key check guarding every /api/* route.
   queue.js                Serializes lookup jobs so only one browser/
                            2Captcha run is ever in flight at once.
+  taxpayer-cache-gateway.js  The two-gate cache orchestration POST
+                              /api/taxpayer runs through — see "Result
+                              caching" below and
+                              docs/gstin-cache-architecture-plan.md.
 
 utils/
   gstin.js                GSTIN format validation (shape only, not
@@ -60,6 +64,9 @@ captcha/
   solver.js                  2Captcha integration: create task, poll
                               for result. The only module that speaks
                               2Captcha's HTTP contract.
+  own-model-solver.js          Talks to ml-service/ (our own trained
+                                model) over HTTP — tried before 2Captcha.
+                                See Level 6 in the roadmap below.
   validator.js                Confirms a solver's output is exactly
                                N numeric digits before it's used.
 
@@ -78,32 +85,65 @@ storage/
   failure-store.js               Saves a full-page screenshot on
                                   workflow failure, organized by date
                                   (data/failures/<YYYY-MM-DD>/).
-  results-store.js                Saves successful lookup results as
-                                   JSON (data/results/) and reads the
-                                   latest one back for the /cached
-                                   endpoint.
+  captcha-failure-store.js        Always-on forensic record of every
+                                   own-model CAPTCHA attempt that wasn't
+                                   a clean first-try success (data/
+                                   captcha-failures/).
+  results-store.js                Saves EVERY successful lookup as its
+                                   own timestamped JSON file (data/
+                                   results/) — a permanent audit trail —
+                                   and reads the latest one back for the
+                                   /cached endpoint. Never overwritten;
+                                   see taxpayer-cache-store.js below for
+                                   the different, newer concept.
+  taxpayer-cache-store.js         The canonical, ONE-record-per-GSTIN
+                                   cache (data/taxpayer-cache/),
+                                   overwritten on every refresh. See
+                                   "Result caching" below.
 
 scripts/
   collect-dataset.js                  Bulk-runs POST /api/taxpayer to
                                        rack up successful CAPTCHA
-                                       solves for the dataset.
+                                       solves for the dataset. Always
+                                       forces a live lookup
+                                       (maxCacheAgeMs: 0) so the result
+                                       cache doesn't interfere with it.
   upload-dataset.js                    Zips completed batches of
                                         data/dataset/ and uploads
                                         them to S3. See "S3 batch
                                         upload" below.
 
+ml-service/                        Standalone FastAPI process serving
+                                    our own trained CAPTCHA model. See
+                                    Level 6 in the roadmap below and
+                                    this folder's own module docstrings.
+
+test/                               Automated tests (see "Testing"
+                                     below). No framework/dependency —
+                                     plain Node `assert`, each file run
+                                     as its own process.
+
+docs/
+  gstin-cache-architecture-plan.md   The approved design doc for the
+                                      result cache — the full reasoning,
+                                      diagrams, and worked examples
+                                      behind "Result caching" below.
+
 data/                              Created at runtime, gitignored.
   captchas/
   failures/<date>/
+  captcha-failures/images/<date>/, captcha-failures/failures.jsonl
   dataset/images/<date>/, dataset/labels.jsonl,
     dataset/.upload-state.json (upload-dataset.js's own progress
     cursor), dataset/.tmp/ (scratch space for in-progress zips)
-  results/
+  results/                          permanent per-lookup audit trail
+  taxpayer-cache/                   ONE file per GSTIN, overwritten on
+                                     every refresh — the result cache
 
 logs/
   application.log                  Created at runtime, gitignored.
 
-.env                                Secrets only (TWOCAPTCHA_API_KEY).
+.env                                Secrets + optional config overrides.
 .env.example                        Template — copy to .env and fill in.
 ```
 
@@ -175,6 +215,31 @@ A few things matter for a real run there, though:
   25.x expects a modern Node regardless). `nvm` or NodeSource's setup
   script both work fine for getting one installed.
 
+## Testing
+
+```
+npm test
+```
+
+Runs everything under `test/` (24 tests as of this writing): the result
+cache store in isolation (round-tripping, GSTIN normalization,
+atomic-write safety, corrupted-record handling), the two-gate cache
+gateway (hit/miss, per-request freshness overrides, the kill switch,
+and — the one that actually matters — 2-way and 3-way concurrent
+requests for the same GSTIN, asserting only one live lookup ever runs),
+and an HTTP smoke test that boots the real Express app and exercises
+auth/validation/404s over a real socket. No test framework or mocking
+library is installed — each `test/*.test.js` file is plain Node
+`assert`, and `test/run-all.js` runs each one as its own process so
+tests that mutate shared config or monkey-patch another module's
+exports can never leak into each other.
+
+This does **not** replace a real end-to-end run against the live
+portal — nothing here launches a real browser or spends a real
+2Captcha/own-model call. It's a fast, free confidence check for the
+cache/routing logic; run a real lookup by hand (or `collect-dataset.js`)
+to validate the actual portal-facing behavior.
+
 ## Bulk dataset collection
 
 `scripts/collect-dataset.js` is an admin tool, not part of the app
@@ -207,6 +272,12 @@ body, and it prints a done/succeeded/failed/left tally after every
 single request. Worth knowing going in: 100 successes means 100 real
 2Captcha charges, and each lookup can take anywhere from ~15 seconds to
 ~2 minutes, so a full run can easily take over an hour.
+
+Every request this script sends explicitly includes
+`"maxCacheAgeMs": 0`, forcing a genuine live lookup every single time —
+without that, the result cache (see "Result caching" below) would
+serve attempt 1's cached answer to every subsequent attempt, and
+dataset collection would silently stop collecting anything.
 
 ## S3 batch upload
 
@@ -292,22 +363,30 @@ ever happens, CORS headers would need to be added back in `server/app.js`.
 
 ### Endpoints
 
-- `POST /api/taxpayer` — body `{ "gstin": "27AOHPA6448R1ZC" }`. Runs a
-  real lookup: launches a browser, solves a real CAPTCHA via 2Captcha
-  (a paid call), submits, intercepts `taxpayerDetails`. This is a
-  `POST`, deliberately, not a `GET` — it has real side effects (cost,
-  time, disk writes), so it shouldn't be something a cache or a crawler
-  could trigger by accident. Concurrent requests are queued and served
-  one at a time (`server/queue.js`) rather than launching multiple
-  browsers at once. Can take up to a couple of minutes; the HTTP server
+- `POST /api/taxpayer` — body `{ "gstin": "27AOHPA6448R1ZC", "maxCacheAgeMs"?: number }`.
+  Cache-aware: serves a fresh-enough cached result when one exists, or
+  runs a real lookup (launches a browser, solves a real CAPTCHA,
+  submits, intercepts `taxpayerDetails`) when it doesn't — see "Result
+  caching" below for the full design. This is a `POST`, deliberately,
+  not a `GET` — a cache MISS has real side effects (cost, time, disk
+  writes), so it shouldn't be something a cache or a crawler could
+  trigger by accident. Any live lookup is queued and served one at a
+  time (`server/queue.js`) rather than launching multiple browsers at
+  once, and can take up to a couple of minutes; the HTTP server
   timeout is set accordingly (`config.server.requestTimeoutMs`).
   Responds `400` on a malformed GSTIN (checked locally, before any
-  browser/2Captcha cost is spent), `401`/`503` on a bad/missing/
-  unconfigured API key, `502` if the portal lookup itself fails, `200`
-  with the raw `taxpayerDetails` JSON on success.
+  cache lookup or browser/2Captcha cost is spent), `401`/`503` on a
+  bad/missing/unconfigured API key, `502` if a live portal lookup
+  fails, `200` with the raw `taxpayerDetails` JSON (never reshaped,
+  whether served from cache or freshly fetched) on success. Also sets
+  an `X-Cache: HIT` or `X-Cache: MISS` response header so callers/logs
+  can tell which path served the request.
 - `GET /api/taxpayer/:gstin/cached` — returns the most recently stored
-  result for that GSTIN straight from `data/results/`, no browser
-  involved. `404` if nothing has been looked up for that GSTIN yet.
+  result for that GSTIN straight from `data/results/` (the permanent
+  audit trail), no browser involved, and no freshness check — `404` if
+  nothing has been looked up for that GSTIN yet. Deliberately a
+  different contract from `POST`'s cache: "whatever's on record,
+  however old" vs. "a fresh-enough answer, refreshing if needed."
 - `GET /health` — `{ status: "ok", queueLength: <n> }`. No API key
   required.
 
@@ -322,6 +401,49 @@ curl -X POST http://localhost:4000/api/taxpayer \
 
 Nothing here reshapes the taxpayer JSON — see the design note below.
 
+## Result caching
+
+`POST /api/taxpayer` is backed by a disk-based cache, keyed by GSTIN,
+so a repeat lookup for a client that was already checked recently
+doesn't have to pay for another browser/CAPTCHA run. Full design
+reasoning, diagrams, and worked timeline examples live in
+`docs/gstin-cache-architecture-plan.md` — this section is the short
+version.
+
+- **One canonical record per GSTIN** (`data/taxpayer-cache/<GSTIN>.json`),
+  overwritten in place on every refresh — never a growing pile of
+  files for the same GSTIN. This is a different, newer concept from
+  `data/results/`'s permanent per-lookup audit trail, which is
+  untouched by this feature and keeps recording every real lookup
+  exactly as it always has.
+- **Freshness is a per-request decision, not a fixed constant.** Pass
+  `maxCacheAgeMs` in the request body to say how old a cached result
+  is acceptable for that specific call; omit it to use
+  `config.resultCache.defaultMaxAgeMs` (24h by default); pass `0` to
+  force a live lookup regardless of what's cached.
+- **At most one live lookup per GSTIN, even under concurrent
+  requests** — `server/taxpayer-cache-gateway.js` checks freshness
+  once fast, outside the lookup queue (the common case: an instant
+  cache hit), and re-checks it a second time right before actually
+  running a lookup, inside the queue. Because the queue is strictly
+  ordered, a burst of simultaneous requests for the same GSTIN never
+  triggers more than one real lookup — whoever's turn comes later just
+  finds the cache already refreshed. No distributed lock or external
+  service needed for this on a single process.
+- **Disk, not Redis, and that was a deliberate call, not an
+  oversight** — this is a single-process API with no existing
+  database dependency, and the queue above already gives the
+  concurrency guarantee a distributed lock would otherwise be for.
+  Revisit this specifically if this service is ever deployed as
+  multiple concurrent instances, or on a host whose local filesystem
+  doesn't persist across restarts — see the architecture doc's
+  section 7 for the full reasoning.
+- **Config**: `config.resultCache.enabled` (kill switch — `false`
+  restores pre-cache behavior exactly) and
+  `config.resultCache.defaultMaxAgeMs`, both overridable via
+  `RESULT_CACHE_ENABLED` / `RESULT_CACHE_DEFAULT_MAX_AGE_MS` in
+  `.env` (see `.env.example`).
+
 ## Design decisions carried over from the original script
 
 - The taxpayerDetails response listener is armed with
@@ -335,20 +457,24 @@ Nothing here reshapes the taxpayer JSON — see the design note below.
 - Saving debug images, failure screenshots, and results are all
   best-effort: a storage failure logs a warning and returns `null`
   rather than throwing, so it can never mask or replace the real
-  workflow error.
+  workflow error. The result cache store follows the same rule.
 - The `taxpayerDetails` JSON handed back by `submitAndIntercept` is never
   reshaped, renamed, or filtered anywhere in the pipeline —
   `pipeline/pipeline.js` passes it straight to `results-store.js`, and
   `server/app.js` sends it straight to the HTTP response, exactly as the
-  network response contained it.
+  network response contained it. Serving it from cache doesn't change
+  this — a cache HIT returns the exact same JSON a live lookup would
+  have, with the HIT/MISS signal carried only in the `X-Cache` header.
 - The live lookup endpoint is a `POST`, not a `GET`, because it isn't
-  safe/idempotent in the HTTP sense — it costs a 2Captcha credit and
-  writes files on every call. Reading back a previous result (`/cached`)
+  safe/idempotent in the HTTP sense — a cache MISS costs a 2Captcha
+  credit and writes files. Reading back a previous result (`/cached`)
   has no side effects, so that one is a `GET`.
 - Lookup jobs run through a single-lane queue (`server/queue.js`) rather
   than in parallel — one Chromium instance and one 2Captcha task at a
   time. This is a deliberate simplicity choice for a single-consumer
-  internal API, not a hard limitation of the design.
+  internal API, not a hard limitation of the design. The result cache's
+  concurrency safety (see above) is built entirely on top of this same
+  queue rather than adding a second mechanism.
 - API key comparison in `server/auth.js` uses `crypto.timingSafeEqual`
   rather than `===`, and the middleware fails closed (rejects
   everything) if `API_KEYS` isn't set, rather than failing open.
@@ -396,9 +522,19 @@ Nothing here reshapes the taxpayer JSON — see the design note below.
   the Level 3 dataset store with `portalConfirmed`/`solverConfidence` set
   accordingly. `pipeline/pipeline.js`'s `solveAndSubmitWithRetries` is
   where all of this is sequenced. See `ml-service/`'s own module
-  docstrings for the serving side. **Still open:** the confidence
-  thresholds are starting values, not calibrated ones, and this hasn't
-  yet been run against the live portal end-to-end.
+  docstrings for the serving side. The service also runs one dummy
+  warm-up inference at startup, before accepting real traffic — a
+  freshly loaded model's first real forward pass otherwise pays a
+  one-time cost that showed up in production as a client-side timeout
+  on attempt 1. **Still open:** the confidence thresholds are starting
+  values, not calibrated ones.
+- **Level 7 — Result caching. Built.** `POST /api/taxpayer` is now
+  cache-aware — see "Result caching" above and
+  `docs/gstin-cache-architecture-plan.md` for the full design. Disk-
+  based, GSTIN-keyed, one record per GSTIN, freshness resolved
+  per-request with a configurable default, at most one live lookup per
+  GSTIN even under concurrent requests. Automated tests for this live
+  under `test/` (see "Testing" above).
 
 Levels 4-5 aren't built yet. The Level 3 dataset store is live and wired
 into `pipeline/pipeline.js` (so both `main.js` and `server.js` feed it),
@@ -420,12 +556,24 @@ per the "don't rush into training" plan.
   run (e.g. while validating the own-model CAPTCHA path above); leave it
   unset for normal/server use.
 - **No rate limiting.** A valid API key can currently fire lookups back
-  to back through the queue, each one a paid 2Captcha call. Not an issue
-  for one trusted client (Hi Life Nx); worth adding if more keys get
-  handed out.
+  to back through the queue, each one a paid 2Captcha call (on a cache
+  MISS). Not an issue for one trusted client (Hi Life Nx); worth adding
+  if more keys get handed out.
 - **`ml-service/` is real code, not generated data.** Unlike `data/`
   (blanket-ignored), `ml-service/*.py` is tracked normally in git — only
   its own generated/large artifacts are excluded: `ml-service/checkpoint/`
   (the ~150MB `best_model.pt`, synced onto each machine directly rather
   than committed) and the usual Python venv/`__pycache__` patterns. See
   `.gitignore` for the exact rules.
+- **The result cache has no negative-cache / staleness-on-error
+  fallback yet.** An invalid GSTIN isn't cached as "invalid" (every
+  attempt re-validates against the portal), and if a live lookup fails
+  outright, there's currently no fallback to serving a stale cached
+  result instead of a `502` — both were discussed and deliberately
+  deferred; see the architecture doc's "explicitly out of scope"
+  section.
+- **Redis was deliberately not used for the result cache** — this is a
+  single-process deployment today, so the concurrency guarantee a
+  distributed lock would provide is already covered by the existing
+  queue. Revisit if this ever runs as multiple concurrent instances, or
+  on a host whose local disk doesn't persist across restarts/redeploys.

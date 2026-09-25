@@ -186,6 +186,46 @@ module.exports = {
     },
 
     // ------------------------------------------------------
+    // Taxpayer result cache (disk-based, two-layer-gatekept —
+    // see docs/gstin-cache-architecture-plan.md for the full
+    // design and the reasoning behind every knob below).
+    //
+    // This is what lets POST /api/taxpayer skip the expensive
+    // browser/CAPTCHA lookup for a GSTIN that was already looked
+    // up recently enough, instead of running a fresh lookup on
+    // every single call. It's a separate concept from
+    // storage/results-store.js's permanent audit trail, which
+    // is untouched by this feature and keeps recording every
+    // real lookup exactly as it always has.
+    // ------------------------------------------------------
+    resultCache: {
+
+        // Master switch. false = the cache is never consulted or
+        // written to at all — POST /api/taxpayer behaves exactly
+        // as it did before this feature existed (always a live
+        // lookup). Same instant-rollback pattern as
+        // ownModelSolver.enabled above.
+        enabled: process.env.RESULT_CACHE_ENABLED !== "false",
+
+        // How old a cached result is allowed to be before it's
+        // considered stale, WHEN THE CALLER DOESN'T SPECIFY
+        // maxCacheAgeMs in the request body. A caller can always
+        // override this per-request — see server/app.js and
+        // server/taxpayer-cache-gateway.js — since how fresh a
+        // lookup needs to be genuinely varies by situation
+        // (onboarding a brand-new client vs. the fifth invoice
+        // this week for a repeat one), not just by GSTIN.
+        //
+        // 24h is a starting point, not a calibrated number: this
+        // product's GSTIN pool repeats heavily and registration
+        // details rarely change, but GST status (active/cancelled)
+        // IS the one field that can change without warning, and
+        // this is a compliance-relevant invoicing system — so this
+        // defaults to a bounded window, never "forever."
+        defaultMaxAgeMs: intFromEnv(process.env.RESULT_CACHE_DEFAULT_MAX_AGE_MS, 24 * 60 * 60 * 1000)
+    },
+
+    // ------------------------------------------------------
     // Dataset collection (Level 3/4 of the roadmap).
     //
     // Off by default. We deliberately don't start collecting
@@ -270,6 +310,13 @@ module.exports = {
         captchasDir: path.join(projectRoot, "data", "captchas"),
         failuresDir: path.join(projectRoot, "data", "failures"),
         resultsDir: path.join(projectRoot, "data", "results"),
+
+        // Canonical per-GSTIN cache record (storage/taxpayer-cache-store.js).
+        // Deliberately a separate directory from resultsDir above:
+        // resultsDir accumulates one new timestamped file per lookup
+        // forever (the permanent audit trail); this one holds exactly
+        // one file per distinct GSTIN, overwritten on every refresh.
+        taxpayerCacheDir: path.join(projectRoot, "data", "taxpayer-cache"),
 
         // Own-model CAPTCHA failure forensics (storage/captcha-failure-store.js).
         // Deliberately separate from failuresDir above (that one is generic

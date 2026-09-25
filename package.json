@@ -8,7 +8,7 @@
     "server": "node server.js",
     "collect-dataset": "node scripts/collect-dataset.js",
     "upload-dataset": "node scripts/upload-dataset.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test/run-all.js"
   },
   "keywords": [],
   "author": "",
