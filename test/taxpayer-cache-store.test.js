@@ -109,4 +109,33 @@ test("isFresh: a record timestamped in the future (clock skew) is never trusted 
     assert.equal(isFresh({ fetchedAt: Date.now() + 60000 }, 5000), false);
 });
 
+test("an orphaned .tmp file is cleaned up if fs.rename fails after fs.writeFile already succeeded", async () => {
+    // Monkey-patches the SAME fs/promises module object
+    // storage/taxpayer-cache-store.js already holds a reference to
+    // (Node caches modules by resolved path, so `require("fs/promises")`
+    // here returns that identical object) — no special require-order
+    // trick needed, unlike the pipeline-mocking technique used in
+    // taxpayer-cache-gateway.test.js, since this patches a method on
+    // a shared object rather than replacing a destructured reference.
+    const fsp = require("fs/promises");
+    const originalRename = fsp.rename;
+    fsp.rename = async () => { throw new Error("simulated rename failure"); };
+
+    try {
+        const gstin = "21RENAMEFAIL1Z1";
+        const result = await setCached(gstin, { legalName: "should not persist" });
+        assert.equal(result, null, "setCached should return null (non-fatal failure) when the rename fails");
+
+        const leftoverTmpFiles = fs.readdirSync(config.paths.taxpayerCacheDir)
+            .filter(name => name.startsWith(gstin) && name.endsWith(".tmp"));
+        assert.deepEqual(
+            leftoverTmpFiles,
+            [],
+            "a failed rename must not leave an orphaned .tmp file behind"
+        );
+    } finally {
+        fsp.rename = originalRename;
+    }
+});
+
 runTests();

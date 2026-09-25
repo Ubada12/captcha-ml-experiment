@@ -222,7 +222,24 @@ module.exports = {
         // IS the one field that can change without warning, and
         // this is a compliance-relevant invoicing system — so this
         // defaults to a bounded window, never "forever."
-        defaultMaxAgeMs: intFromEnv(process.env.RESULT_CACHE_DEFAULT_MAX_AGE_MS, 24 * 60 * 60 * 1000)
+        //
+        // Floored at 0: unlike the per-request override (validated
+        // in server/validate-taxpayer-request.js, which rejects a
+        // negative value outright with a 400), a misconfigured
+        // negative RESULT_CACHE_DEFAULT_MAX_AGE_MS in .env has no
+        // caller to reject it to — intFromEnv alone would happily
+        // return e.g. -5000, and isFresh() treats any maxAgeMs <= 0
+        // as "never fresh," so a negative default would silently
+        // defeat caching for every default-path request forever,
+        // with nothing in the logs to explain why. Falling back to
+        // the hard 24h default instead keeps that failure mode from
+        // being silent-and-permanent; 0 itself is left alone (a
+        // deliberate, if unusual, "never use the default cache
+        // window" choice, same convention as the per-request value).
+        defaultMaxAgeMs: (() => {
+            const parsed = intFromEnv(process.env.RESULT_CACHE_DEFAULT_MAX_AGE_MS, 24 * 60 * 60 * 1000);
+            return parsed < 0 ? 24 * 60 * 60 * 1000 : parsed;
+        })()
     },
 
     // ------------------------------------------------------
@@ -249,7 +266,11 @@ module.exports = {
     // API server (Level 3.5)
     // ------------------------------------------------------
     server: {
-        port: parseInt(process.env.PORT, 10) || 4000,
+        // intFromEnv, not `parseInt(...) || 4000` — see that helper's
+        // own comment. PORT=0 is a real, valid "let the OS assign an
+        // ephemeral port" convention (used by this project's own
+        // smoke test), and `|| 4000` would silently discard it.
+        port: intFromEnv(process.env.PORT, 4000),
 
         // A single lookup can legitimately take a couple of minutes —
         // CAPTCHA polling alone can run up to maxPollAttempts *
@@ -295,8 +316,10 @@ module.exports = {
         // Upload once this many new, not-yet-uploaded samples have
         // accumulated. --flush (see the script) overrides this to
         // upload whatever's pending regardless of size — for the
-        // last partial batch at the end of a run.
-        batchSize: parseInt(process.env.DATASET_BATCH_SIZE, 10) || 1000
+        // last partial batch at the end of a run. intFromEnv, not
+        // `parseInt(...) || 1000` — same reasoning as server.port
+        // above, kept consistent across the file.
+        batchSize: intFromEnv(process.env.DATASET_BATCH_SIZE, 1000)
     },
 
     // ------------------------------------------------------

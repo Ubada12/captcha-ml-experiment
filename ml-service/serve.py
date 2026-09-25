@@ -172,10 +172,22 @@ def _warm_up(model):
 
     start_time = time.monotonic()
     with torch.no_grad():
-        model(dummy_input)
+        dummy_output = model(dummy_input)
     warm_up_ms = (time.monotonic() - start_time) * 1000
 
-    logger.info(f"Model warm-up forward pass complete in {warm_up_ms:.1f}ms.")
+    # Logging the actual output shape (not just the timing) means the
+    # sequence length T the deployed checkpoint actually produces for
+    # this input size is visible in the startup logs on every boot —
+    # model.py's forward() docstring used to claim this was "verified
+    # at load time by serve.py," which wasn't true (nothing here ever
+    # asserted a specific T); this is what makes that claim actually
+    # true, as a visible log line an operator can check, rather than
+    # a silent runtime assertion against a hardcoded value this
+    # service has no independent way to confirm is still correct.
+    logger.info(
+        f"Model warm-up forward pass complete in {warm_up_ms:.1f}ms "
+        f"(output shape {tuple(dummy_output.shape)}, sequence_length={dummy_output.shape[1]})."
+    )
 
 
 try:
@@ -248,10 +260,29 @@ def predict(request: PredictRequest):
 
     input_tensor = input_tensor.to(_device)
 
-    with torch.no_grad():
-        logits = _model(input_tensor)
+    # prepare_input() above already has its own try/except for a bad
+    # IMAGE payload (InvalidImageError -> 400). This one guards the
+    # model/decode step itself: found during the pre-deployment audit
+    # that a mid-inference exception here had no handler at all, so it
+    # fell through to FastAPI's default handler and came back as a
+    # plain-text 500 — inconsistent with every other error path in
+    # this endpoint, which always returns the same JSON {"error": ...}
+    # shape. Deliberately broad (any exception, not a specific type):
+    # there's no single expected failure mode for "something went
+    # wrong inside a forward pass," and the goal here is purely
+    # response-shape consistency, not distinguishing failure causes.
+    try:
+        with torch.no_grad():
+            logits = _model(input_tensor)
 
-    prediction = decode_with_confidence(logits)
+        prediction = decode_with_confidence(logits)
+
+    except Exception as error:  # noqa: BLE001 — see comment above
+        logger.error(f"Inference failed unexpectedly: {error}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Inference failed unexpectedly.", "details": str(error)},
+        )
 
     inference_ms = (time.monotonic() - start_time) * 1000
 

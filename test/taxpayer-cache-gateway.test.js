@@ -110,7 +110,7 @@ test("a smaller per-request maxCacheAgeMs overrides the configured default", asy
     assert.equal(runLookupCallCount, 1);
 });
 
-test("resultCache.enabled = false bypasses the cache entirely, even with a fresh entry present", async () => {
+test("resultCache.enabled = false bypasses the cache entirely — no read AND no write", async () => {
     resetCallCounter();
     const gstin = "15DISABLED05Z5";
     await setCached(gstin, { legalName: "should be ignored" });
@@ -120,9 +120,58 @@ test("resultCache.enabled = false bypasses the cache entirely, even with a fresh
         const result = await getOrRefreshTaxpayer(gstin, {});
         assert.equal(result.cacheStatus, "MISS");
         assert.equal(runLookupCallCount, 1, "disabling the cache must still perform a live lookup");
+
+        // The bug this test used to miss (found in the pre-deployment
+        // audit): the disabled branch called refreshTaxpayer(), which
+        // unconditionally wrote the fresh result back to the cache
+        // store — so "disabled" only ever meant "don't read," not the
+        // "never consulted or written to at all" config.js promises.
+        // Checking the store directly (bypassing the gateway, which
+        // is still disabled) proves the pre-existing record was left
+        // alone, not silently overwritten by the live lookup above.
+        const stored = await getCached(gstin);
+        assert.equal(
+            stored.data.legalName,
+            "should be ignored",
+            "disabling the cache must mean the live lookup's fresh result is NOT written back either"
+        );
     } finally {
         config.resultCache.enabled = true; // restore for any tests after this one
     }
+});
+
+test("concurrency: a burst of maxCacheAgeMs:0 (force-refresh) requests for the same GSTIN still only triggers one live lookup", async () => {
+    resetCallCounter();
+    runLookupDelayMs = 40; // widen the race window so all three requests' Gate 1 checks land before the first one finishes
+    const gstin = "18FORCEBURST08Z8";
+    await setCached(gstin, { legalName: "stale-by-choice" }); // present but must be ignored by every request in the burst — maxCacheAgeMs: 0 means "never fresh"
+    // A small real gap between the pre-existing write above and the
+    // burst below, so this test isn't relying on sub-millisecond
+    // timing luck to tell them apart (Date.now() is only
+    // millisecond-resolution — see the gateway's own comment on why
+    // it compares with a strict `>`, not `>=`).
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    // The bug this covers (found in the pre-deployment audit): Gate
+    // 2's re-check used to rely solely on isFresh(record, maxAgeMs),
+    // which is unconditionally false whenever maxAgeMs <= 0 — so even
+    // the two requests queued BEHIND the one that actually ran the
+    // live lookup would themselves each run their own live lookup,
+    // since "is this fresh enough" can never be true under force-
+    // refresh semantics. Fixed with a "was this refreshed after I
+    // arrived" check in the gateway, specific to maxAgeMs <= 0.
+    const results = await Promise.all([
+        getOrRefreshTaxpayer(gstin, { maxCacheAgeMs: 0 }),
+        getOrRefreshTaxpayer(gstin, { maxCacheAgeMs: 0 }),
+        getOrRefreshTaxpayer(gstin, { maxCacheAgeMs: 0 })
+    ]);
+
+    assert.equal(runLookupCallCount, 1, "a concurrent force-refresh burst for one GSTIN must still only run one live lookup");
+
+    const missCount = results.filter(r => r.cacheStatus === "MISS").length;
+    const hitCount = results.filter(r => r.cacheStatus === "HIT").length;
+    assert.equal(missCount, 1, "exactly one request in the burst should be the MISS that did the work");
+    assert.equal(hitCount, 2, "the other two should be HITs off the one live lookup's result, not separate live lookups");
 });
 
 test("concurrency: two simultaneous requests for the same GSTIN trigger exactly ONE live lookup", async () => {

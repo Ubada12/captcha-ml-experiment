@@ -38,6 +38,10 @@ server/
                               /api/taxpayer runs through — see "Result
                               caching" below and
                               docs/gstin-cache-architecture-plan.md.
+  validate-taxpayer-request.js  Validates POST /api/taxpayer's body
+                                  (gstin, maxCacheAgeMs) before the
+                                  cache or the queue is ever touched —
+                                  see "Result caching" below.
 
 utils/
   gstin.js                GSTIN format validation (shape only, not
@@ -221,18 +225,23 @@ A few things matter for a real run there, though:
 npm test
 ```
 
-Runs everything under `test/` (24 tests as of this writing): the result
+Runs everything under `test/` (43 tests as of this writing): the result
 cache store in isolation (round-tripping, GSTIN normalization,
-atomic-write safety, corrupted-record handling), the two-gate cache
-gateway (hit/miss, per-request freshness overrides, the kill switch,
-and — the one that actually matters — 2-way and 3-way concurrent
-requests for the same GSTIN, asserting only one live lookup ever runs),
-and an HTTP smoke test that boots the real Express app and exercises
+atomic-write safety including orphaned-temp-file cleanup, corrupted-
+record handling), request-body validation in isolation (every
+gstin/maxCacheAgeMs edge case, including the `maxCacheAgeMs: null`
+case a pre-deployment audit found being silently mishandled), the
+two-gate cache gateway (hit/miss, per-request freshness overrides, the
+kill switch — now verified to skip writes too, not just reads — and
+2-way/3-way/force-refresh-burst concurrent requests for the same
+GSTIN, asserting only one live lookup ever runs), and an HTTP smoke
+test that boots the real Express app and exercises
 auth/validation/404s over a real socket. No test framework or mocking
 library is installed — each `test/*.test.js` file is plain Node
 `assert`, and `test/run-all.js` runs each one as its own process so
 tests that mutate shared config or monkey-patch another module's
-exports can never leak into each other.
+exports can never leak into each other. A test file that registers
+zero tests fails loudly rather than silently reporting "0/0 passed."
 
 This does **not** replace a real end-to-end run against the live
 portal — nothing here launches a real browser or spends a real
@@ -363,7 +372,7 @@ ever happens, CORS headers would need to be added back in `server/app.js`.
 
 ### Endpoints
 
-- `POST /api/taxpayer` — body `{ "gstin": "27AOHPA6448R1ZC", "maxCacheAgeMs"?: number }`.
+- `POST /api/taxpayer` — body `{ "gstin": "27AOHPA6448R1ZC", "maxCacheAgeMs"?: number|null }`.
   Cache-aware: serves a fresh-enough cached result when one exists, or
   runs a real lookup (launches a browser, solves a real CAPTCHA,
   submits, intercepts `taxpayerDetails`) when it doesn't — see "Result
@@ -374,13 +383,20 @@ ever happens, CORS headers would need to be added back in `server/app.js`.
   time (`server/queue.js`) rather than launching multiple browsers at
   once, and can take up to a couple of minutes; the HTTP server
   timeout is set accordingly (`config.server.requestTimeoutMs`).
-  Responds `400` on a malformed GSTIN (checked locally, before any
-  cache lookup or browser/2Captcha cost is spent), `401`/`503` on a
-  bad/missing/unconfigured API key, `502` if a live portal lookup
-  fails, `200` with the raw `taxpayerDetails` JSON (never reshaped,
-  whether served from cache or freshly fetched) on success. Also sets
-  an `X-Cache: HIT` or `X-Cache: MISS` response header so callers/logs
-  can tell which path served the request.
+  The whole body is validated by `server/validate-taxpayer-request.js`
+  before any cache lookup or browser/2Captcha cost is spent: `gstin`
+  is required and must be a validly-shaped GSTIN; `maxCacheAgeMs` is
+  optional — omit it, or send `null`, to use
+  `config.resultCache.defaultMaxAgeMs`, or send a finite number `>= 0`
+  (`0` forces a live lookup) — anything else (a negative number, a
+  string, `NaN`, a boolean, ...) is rejected. Responds `400` with
+  `{ "error": "Invalid request body.", "details": [...] }` listing
+  every problem found, `401`/`503` on a bad/missing/unconfigured API
+  key, `502` if a live portal lookup fails, `200` with the raw
+  `taxpayerDetails` JSON (never reshaped, whether served from cache or
+  freshly fetched) on success. Also sets an `X-Cache: HIT` or
+  `X-Cache: MISS` response header so callers/logs can tell which path
+  served the request.
 - `GET /api/taxpayer/:gstin/cached` — returns the most recently stored
   result for that GSTIN straight from `data/results/` (the permanent
   audit trail), no browser involved, and no freshness check — `404` if
@@ -418,18 +434,29 @@ version.
   exactly as it always has.
 - **Freshness is a per-request decision, not a fixed constant.** Pass
   `maxCacheAgeMs` in the request body to say how old a cached result
-  is acceptable for that specific call; omit it to use
-  `config.resultCache.defaultMaxAgeMs` (24h by default); pass `0` to
-  force a live lookup regardless of what's cached.
+  is acceptable for that specific call; omit it (or send `null`) to
+  use `config.resultCache.defaultMaxAgeMs` (24h by default); pass `0`
+  to force a live lookup regardless of what's cached. All of this is
+  validated up front — see the `POST /api/taxpayer` endpoint docs
+  above for exactly what's accepted and rejected.
 - **At most one live lookup per GSTIN, even under concurrent
-  requests** — `server/taxpayer-cache-gateway.js` checks freshness
-  once fast, outside the lookup queue (the common case: an instant
-  cache hit), and re-checks it a second time right before actually
-  running a lookup, inside the queue. Because the queue is strictly
-  ordered, a burst of simultaneous requests for the same GSTIN never
-  triggers more than one real lookup — whoever's turn comes later just
-  finds the cache already refreshed. No distributed lock or external
-  service needed for this on a single process.
+  requests — including a concurrent burst of force-refreshes.**
+  `server/taxpayer-cache-gateway.js` checks freshness once fast,
+  outside the lookup queue (the common case: an instant cache hit),
+  and re-checks it a second time right before actually running a
+  lookup, inside the queue. Because the queue is strictly ordered, a
+  burst of simultaneous requests for the same GSTIN never triggers
+  more than one real lookup — whoever's turn comes later just finds
+  the cache already refreshed, and this holds even for a burst of
+  `maxCacheAgeMs: 0` requests (a request queued behind another one
+  that already force-refreshed the same GSTIN gets that fresh result
+  instead of running its own redundant lookup). No distributed lock or
+  external service needed for this on a single process.
+- **The kill switch genuinely means "never consulted or written to at
+  all."** `config.resultCache.enabled = false` skips both the cache
+  read AND the cache write on every request — a live lookup runs and
+  its result is returned, but nothing is ever cached until the switch
+  is turned back on.
 - **Disk, not Redis, and that was a deliberate call, not an
   oversight** — this is a single-process API with no existing
   database dependency, and the queue above already gives the
@@ -438,11 +465,12 @@ version.
   multiple concurrent instances, or on a host whose local filesystem
   doesn't persist across restarts — see the architecture doc's
   section 7 for the full reasoning.
-- **Config**: `config.resultCache.enabled` (kill switch — `false`
-  restores pre-cache behavior exactly) and
-  `config.resultCache.defaultMaxAgeMs`, both overridable via
-  `RESULT_CACHE_ENABLED` / `RESULT_CACHE_DEFAULT_MAX_AGE_MS` in
-  `.env` (see `.env.example`).
+- **Config**: `config.resultCache.enabled` (kill switch) and
+  `config.resultCache.defaultMaxAgeMs` (floored at 0 — a misconfigured
+  negative value in `.env` falls back to the 24h default rather than
+  silently disabling caching for every default-path request), both
+  overridable via `RESULT_CACHE_ENABLED` / `RESULT_CACHE_DEFAULT_MAX_AGE_MS`
+  in `.env` (see `.env.example`).
 
 ## Design decisions carried over from the original script
 

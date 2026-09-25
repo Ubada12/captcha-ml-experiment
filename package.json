@@ -3,6 +3,9 @@
   "version": "2.0.0",
   "description": "GST portal lookup automation: Puppeteer form fill + CAPTCHA capture -> 2Captcha solve -> submit -> taxpayerDetails API interception.",
   "main": "main.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node main.js",
     "server": "node server.js",

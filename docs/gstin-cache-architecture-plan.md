@@ -1,6 +1,14 @@
-# GSTIN Result Cache — Architecture Plan (Review Draft)
+# GSTIN Result Cache — Architecture Plan
 
-Status: **proposal — not implemented yet**. This document is for review. Nothing in `scrapper/` has been changed to build this; the only completed, separate fix so far is the ml-service cold-start warm-up (see the note at the very end).
+Status: **implemented and shipped** — this is now a historical design record, not a live proposal. Every file listed in §9 below was built exactly as designed here, is covered by the automated test suite under `test/`, and is documented as live in the top-level `README.md` ("Result caching" section and Roadmap "Level 7 — Built"). The rest of this document is left as originally written (including its diagrams, worked examples, and the Redis discussion in §7) because it's still the accurate explanation of *why* the design looks the way it does — only this status line, §9, and §10 have been updated to say so, rather than rewriting the whole thing into past tense.
+
+A whole-project audit done before deployment planning started (see the project's own notes/commit history around that time) found and fixed a small number of gaps against this original design — worth knowing before treating every line below as still 100% precisely how the shipped code behaves:
+
+- The `config.resultCache.enabled = false` kill switch (§4.4) originally still *wrote* to the cache even though reads were correctly skipped — fixed so disabling the switch now means neither reads nor writes happen, matching what this document and `config.js`'s own comment always said it should do.
+- A concurrent burst of `maxCacheAgeMs: 0` (force-refresh) requests for the same GSTIN originally could still trigger one live lookup *per request* in the burst, because Gate 2's re-check (§4.3) used the same `isFresh()` policy check that's unconditionally false for `maxAgeMs <= 0` by definition. Fixed with an additional "was this refreshed while I was queued" check in Gate 2, specific to the `maxAgeMs <= 0` case — the "at most one live lookup per burst" guarantee in §4.3/§6 now genuinely holds for a force-refresh burst too, not just a normal-freshness one.
+- Request-body validation (§4.4's `maxCacheAgeMs`) is now handled by a dedicated `server/validate-taxpayer-request.js`, added after this document was written, which rejects a malformed body with a `400` before either gate runs — this document didn't originally specify that module by name, since it predates the specific bug (a `null` `maxCacheAgeMs` being silently coerced to `0`/force-refresh) that motivated pulling it out on its own.
+
+None of this changes the core design (two-layer gatekeeping on disk, deferred Redis) — see the sections below for that, unchanged.
 
 ---
 
@@ -330,25 +338,26 @@ This was debated at length, so the reasoning is worth keeping on record rather t
 
 ---
 
-## 9. Proposed file changes (for review — nothing built yet)
+## 9. File changes (built exactly as proposed, plus one addition)
 
 | File | Change |
 |---|---|
-| `storage/taxpayer-cache-store.js` | **New.** `getCached`, `setCached`, `isFresh`. Atomic writes. |
-| `server/taxpayer-cache-gateway.js` (name open to bikeshedding) | **New.** The two-gate orchestration in §4.3 — the only place that knows about both gates, the queue, and the cache store. |
-| `server/app.js` | **Modified.** `POST /api/taxpayer` delegates to the gateway instead of calling `runExclusive(() => runLookup(gstin))` directly. Adds `X-Cache` response header. Accepts optional `maxCacheAgeMs` in the body. |
-| `config/config.js` | **Modified.** New `resultCache` section (§4.4). |
-| `storage/results-store.js` | **Unchanged.** Still called on every successful live lookup, exactly as today. |
-| `server/queue.js` | **Unchanged.** Reused as-is — it's the mechanism that makes Gate 2 correct. |
-| `GET /api/taxpayer/:gstin/cached` route | **Unchanged.** |
+| `storage/taxpayer-cache-store.js` | **Built.** `getCached`, `setCached`, `isFresh`, `normalizeGstin`. Atomic writes (with orphaned-temp-file cleanup added during the pre-deployment audit). |
+| `server/taxpayer-cache-gateway.js` | **Built**, under this exact name. The two-gate orchestration in §4.3 — the only place that knows about both gates, the queue, and the cache store. Gate 2 gained an extra check during the pre-deployment audit (see the status note at the top of this document) to cover a concurrent force-refresh burst. |
+| `server/validate-taxpayer-request.js` | **New, added after this document was originally written.** Validates the whole `POST /api/taxpayer` body (`gstin`, `maxCacheAgeMs`) before either gate runs — see the status note at the top. |
+| `server/app.js` | **Built.** `POST /api/taxpayer` delegates to the gateway instead of calling `runExclusive(() => runLookup(gstin))` directly. Adds `X-Cache` response header. Validates the body via the module above before doing anything else. |
+| `config/config.js` | **Built.** `resultCache` section (§4.4), with a floor added on `defaultMaxAgeMs` during the pre-deployment audit. |
+| `storage/results-store.js` | **Unchanged**, as designed. Still called on every successful live lookup, regardless of the cache switch. |
+| `server/queue.js` | **Unchanged**, as designed. Reused as-is — it's the mechanism that makes Gate 2 correct. |
+| `GET /api/taxpayer/:gstin/cached` route | **Unchanged**, as designed. |
 
 ---
 
-## 10. Open items for your review
+## 10. Open items — resolved
 
-1. Is `data/taxpayer-cache/` the right location/name, or would you rather nest it differently relative to `data/results/`?
-2. Any objection to the `X-Cache: HIT/MISS` header approach, versus wanting that signal inside the JSON body somewhere?
-3. Default `defaultMaxAgeMs` — is 24h a reasonable starting point, or do you want a different default given real client behavior?
-4. Naming: `server/taxpayer-cache-gateway.js` vs. folding this logic directly into `server/app.js` vs. some other placement you'd prefer.
+The four questions this document originally closed with, and how each was actually decided:
 
-Nothing gets touched until you've reviewed this and we've talked through any changes.
+1. **`data/taxpayer-cache/` location/name** — kept exactly as proposed; no objection was raised.
+2. **`X-Cache: HIT/MISS` header vs. in the JSON body** — kept as a header; the "never reshaped" body contract was considered more important to preserve than adding this signal.
+3. **`defaultMaxAgeMs` default** — kept at 24h; no real client-behavior data suggested a different starting point, and it's still overridable per-request or via `.env`.
+4. **Naming/placement of the gateway logic** — kept as its own file, `server/taxpayer-cache-gateway.js`, rather than folding it into `server/app.js`; this kept the route handler thin and the concurrency reasoning in exactly one place, which held up well when `server/validate-taxpayer-request.js` was added later as a third, separate concern (request validation, as opposed to cache orchestration).

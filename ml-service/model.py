@@ -121,10 +121,16 @@ class CaptchaCRNN(nn.Module):
 
         Returns:
             logits: Tensor of shape (B, T, 11), where T is the
-                horizontal sequence length (fixed by the
-                architecture — 12 for this checkpoint's input
-                size, verified at load time by serve.py rather
-                than assumed here).
+                horizontal sequence length fixed by the architecture
+                for a given input size (12 for this checkpoint's
+                182px-wide input, per the current backbone/stride
+                config above). Not asserted anywhere in this module —
+                ml-service/serve.py's startup warm-up pass logs the
+                actual output shape (including T) it observes for the
+                deployed checkpoint every time the service boots, so
+                a mismatch (e.g. after an input-size or stride change)
+                shows up in the startup logs rather than being
+                silently assumed correct.
         """
         features = self.backbone(x)  # (B, 512, H, T)
         features = self.height_pool(features)  # (B, 512, 1, T)

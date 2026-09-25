@@ -18,7 +18,7 @@
  *     Liveness check. Also reports current queue depth. No API
  *     key required.
  *
- *   POST /api/taxpayer          body: { "gstin": "...", "maxCacheAgeMs"?: number }
+ *   POST /api/taxpayer          body: { "gstin": "...", "maxCacheAgeMs"?: number|null }
  *     Returns taxpayer data for a GSTIN — from the disk cache
  *     when a fresh-enough result already exists, or by running a
  *     real lookup (launches a browser, solves a real CAPTCHA,
@@ -26,11 +26,19 @@
  *     when it doesn't. See server/taxpayer-cache-gateway.js and
  *     docs/gstin-cache-architecture-plan.md for the full design —
  *     in short: GSTIN is the cache key, a cached result is used
- *     when it's no older than `maxCacheAgeMs` (defaults to
- *     config.resultCache.defaultMaxAgeMs when omitted; pass 0 to
+ *     when it's no older than `maxCacheAgeMs` (omit it, or send
+ *     `null`, to use config.resultCache.defaultMaxAgeMs; pass 0 to
  *     force a live lookup regardless of what's cached), and at
  *     most one live lookup ever runs per GSTIN even under a burst
- *     of concurrent requests for it.
+ *     of concurrent requests for it — including a concurrent burst
+ *     of `maxCacheAgeMs: 0` force-refreshes.
+ *
+ *     The body is fully validated by validate-taxpayer-request.js
+ *     before anything else runs: a missing/malformed `gstin`, or a
+ *     `maxCacheAgeMs` that isn't a finite number >= 0 (when it's
+ *     sent at all — omitting it, or sending `null`, is fine and
+ *     means "use the default"), gets a `400` listing every problem
+ *     found, before the cache or the queue is ever touched.
  *
  *     Deliberately POST, not GET — a cache MISS has real side
  *     effects (may cost a 2Captcha credit, writes files, can take
@@ -62,6 +70,7 @@ const { getOrRefreshTaxpayer } = require("./taxpayer-cache-gateway");
 const { getQueueLength } = require("./queue");
 const { requireApiKey } = require("./auth");
 const { isValidGstin } = require("../utils/gstin");
+const { validateTaxpayerRequestBody } = require("./validate-taxpayer-request");
 const { getLatestResult } = require("../storage/results-store");
 
 function createApp() {
@@ -77,7 +86,7 @@ function createApp() {
     app.use("/api", requireApiKey);
 
     app.get("/api/taxpayer/:gstin/cached", async (req, res) => {
-        const gstin = String(req.params.gstin || "").toUpperCase();
+        const gstin = String(req.params.gstin || "").trim().toUpperCase();
 
         if (!isValidGstin(gstin)) {
             return res.status(400).json({ error: `Invalid GSTIN format: ${gstin}` });
@@ -93,19 +102,18 @@ function createApp() {
     });
 
     app.post("/api/taxpayer", async (req, res) => {
-        const gstin = String(req.body?.gstin || "").toUpperCase();
+        // Validates BOTH fields (gstin format, maxCacheAgeMs type/range)
+        // up front, before the cache or the queue is ever touched — see
+        // validate-taxpayer-request.js for exactly what's checked and
+        // why (in particular: why a bare Number(...) coercion here used
+        // to be a bug for `maxCacheAgeMs: null`).
+        const validation = validateTaxpayerRequestBody(req.body);
 
-        if (!isValidGstin(gstin)) {
-            return res.status(400).json({ error: `Invalid GSTIN format: ${gstin}` });
+        if (!validation.valid) {
+            return res.status(400).json({ error: "Invalid request body.", details: validation.errors });
         }
 
-        // Optional per-request freshness override — see the route's
-        // own doc comment above and server/taxpayer-cache-gateway.js.
-        // Left undefined when the caller doesn't send it, which
-        // resolveMaxAgeMs() there treats as "use the configured
-        // default," not as 0/force-refresh.
-        const rawMaxCacheAgeMs = req.body?.maxCacheAgeMs;
-        const maxCacheAgeMs = rawMaxCacheAgeMs === undefined ? undefined : Number(rawMaxCacheAgeMs);
+        const { gstin, maxCacheAgeMs } = validation;
 
         logger.info(`Received lookup request for GSTIN ${gstin}. Queue depth: ${getQueueLength()}.`);
 

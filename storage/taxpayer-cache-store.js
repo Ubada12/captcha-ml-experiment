@@ -181,6 +181,11 @@ async function setCached(gstin, data) {
         schemaVersion: SCHEMA_VERSION
     };
 
+    // Declared outside the try block so the catch handler below can
+    // still see (and clean up) whichever temp path this attempt was
+    // using, even if the failure happened after it was written.
+    let tmpPath;
+
     try {
         await fs.mkdir(config.paths.taxpayerCacheDir, { recursive: true });
 
@@ -192,7 +197,7 @@ async function setCached(gstin, data) {
         // gate, but this module has no way to enforce that itself —
         // can't clobber each other's temp file mid-write. Only the
         // final atomic rename can ever actually win.
-        const tmpPath = `${finalPath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+        tmpPath = `${finalPath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
 
         await fs.writeFile(tmpPath, JSON.stringify(record, null, 2), "utf8");
         await fs.rename(tmpPath, finalPath); // atomic on the same filesystem
@@ -204,6 +209,19 @@ async function setCached(gstin, data) {
         return record;
 
     } catch (error) {
+
+        // If fs.writeFile succeeded but fs.rename then threw (e.g. a
+        // transient filesystem error), the temp file is left behind
+        // with nothing ever pointing at it again — a slow, silent
+        // leak of `.tmp` files over the process's lifetime. Best-
+        // effort cleanup: this itself must never throw or mask the
+        // real error above, so any unlink failure (including the
+        // completely normal case of the write never having reached
+        // disk at all) is swallowed.
+        if (tmpPath) {
+            await fs.unlink(tmpPath).catch(() => {});
+        }
+
         logger.warn({ err: error }, `Failed to write taxpayer cache for ${normalizedGstin} (non-fatal).`);
         return null;
     }

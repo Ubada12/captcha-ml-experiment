@@ -45,7 +45,12 @@
  * single-process queue that already exists (server/queue.js). No
  * distributed lock, no Redis, no new infrastructure. See
  * docs/gstin-cache-architecture-plan.md section 4.3 for the full
- * walkthrough and worked timeline examples.
+ * walkthrough and worked timeline examples. This also holds for a
+ * concurrent burst of `maxCacheAgeMs: 0` (force-refresh) requests —
+ * see the `requestArrivedAt` / `refreshedWhileWeWaited` logic inside
+ * Gate 2 below, added during the pre-deployment audit once it was
+ * noticed that a plain isFresh() re-check can never say "fresh
+ * enough" when maxAgeMs is 0, by definition.
  *
  * This is also, not coincidentally, the same "check → lock →
  * re-check" shape a Redis-backed version would use later — see
@@ -99,24 +104,44 @@ function resolveMaxAgeMs(requestedMaxAgeMs) {
  * Performs the actual live lookup and writes both stores exactly
  * as POST /api/taxpayer always has:
  *   - storage/results-store.js — the permanent, per-lookup audit
- *     trail (unchanged, still written on every real lookup).
+ *     trail (unchanged, still written on every real lookup, and
+ *     NOT gated by config.resultCache.enabled — the audit trail is
+ *     a separate concern from the fast-path cache and keeps
+ *     recording every real lookup regardless of the cache switch).
  *   - storage/taxpayer-cache-store.js — the canonical, overwritten
- *     cache record this feature adds.
+ *     cache record this feature adds. Skipped entirely when
+ *     `writeCache` is false — see getOrRefreshTaxpayer's
+ *     `!config.resultCache.enabled` branch below for why that
+ *     matters: the master switch's own doc comment in config.js
+ *     promises the cache is "never consulted or written to at
+ *     all" when disabled, and this is what actually keeps that
+ *     promise (a bug found during the pre-deployment audit: this
+ *     used to call setCached() unconditionally, so turning the
+ *     switch off silently kept populating the cache directory
+ *     even though nothing ever read from it again until the
+ *     switch was flipped back on).
  *
  * A cache-write failure is logged but never allowed to fail the
  * request — the live lookup itself already succeeded and that's
  * what the caller actually asked for.
+ *
+ * @param {string} gstin
+ * @param {object} [options]
+ * @param {boolean} [options.writeCache=true] - false when
+ *   config.resultCache.enabled is false; see above.
  */
-async function refreshTaxpayer(gstin) {
+async function refreshTaxpayer(gstin, { writeCache = true } = {}) {
 
     const freshData = await runLookup(gstin);
 
     // Audit trail — unchanged behavior, still one new timestamped
-    // file per real lookup, forever.
+    // file per real lookup, forever, regardless of writeCache.
     await saveResult(gstin, freshData);
 
-    // Canonical cache record — overwritten in place.
-    await setCached(gstin, freshData);
+    if (writeCache) {
+        // Canonical cache record — overwritten in place.
+        await setCached(gstin, freshData);
+    }
 
     return freshData;
 }
@@ -139,15 +164,32 @@ async function getOrRefreshTaxpayer(gstin, options = {}) {
 
     if (!config.resultCache.enabled) {
         // Master switch off — behave exactly as this endpoint did
-        // before the cache existed. Still goes through the queue,
+        // before the cache existed: no read, AND no write (see
+        // refreshTaxpayer's doc comment for why `writeCache: false`
+        // matters here specifically). Still goes through the queue,
         // since that guarantee (only one Puppeteer/2Captcha run at
         // a time) is unrelated to caching and must never be skipped.
-        logger.debug("[Taxpayer Cache] resultCache.enabled=false — skipping cache, running a live lookup.");
-        const data = await runExclusive(() => refreshTaxpayer(gstin));
+        logger.debug("[Taxpayer Cache] resultCache.enabled=false — skipping cache entirely (no read, no write), running a live lookup.");
+        const data = await runExclusive(() => refreshTaxpayer(gstin, { writeCache: false }));
         return { data, cacheStatus: "MISS" };
     }
 
     const maxAgeMs = resolveMaxAgeMs(options.maxCacheAgeMs);
+
+    // Captured before Gate 1 — Gate 2 uses this to detect "did
+    // someone else already refresh this GSTIN while I was waiting in
+    // the queue," which is the fix for a design gap the two-gate
+    // model otherwise has specifically when maxAgeMs <= 0 (force
+    // refresh): isFresh() always returns false for maxAgeMs <= 0 by
+    // definition, so a plain re-check against isFresh() can NEVER
+    // turn a concurrent force-refresh burst into a HIT on Gate 2 —
+    // every request in the burst would run its own live lookup, one
+    // after another through the queue, defeating the "at most one
+    // live lookup per burst" guarantee this whole file exists to
+    // provide. See the concurrency tests in
+    // test/taxpayer-cache-gateway.test.js for the burst scenario this
+    // fixes.
+    const requestArrivedAt = Date.now();
 
     // ------------------------------------------------------
     // GATE 1 — fast pre-check, outside the queue entirely.
@@ -179,12 +221,42 @@ async function getOrRefreshTaxpayer(gstin, options = {}) {
 
         const reCheckRecord = await getCached(gstin);
 
-        if (isFresh(reCheckRecord, maxAgeMs)) {
+        // Normal freshness policy — unaffected by the fix below,
+        // still exactly "is this within the caller's maxAgeMs."
+        const freshByPolicy = isFresh(reCheckRecord, maxAgeMs);
+
+        // The force-refresh fix: ONLY when maxAgeMs <= 0 (isFresh()
+        // would otherwise never say yes), treat a record that was
+        // written at/after the moment THIS request arrived as good
+        // enough — someone ahead of us in the queue already did the
+        // exact live lookup we were about to do, so doing our own on
+        // top of it would be pure waste. This never weakens the
+        // normal maxAgeMs > 0 case: freshByPolicy already covers
+        // that, and this branch is unreachable when maxAgeMs > 0.
+        // Strictly greater-than, not >= : Date.now() only has
+        // millisecond resolution, so a record written a moment
+        // BEFORE this request truly arrived can still read back an
+        // equal timestamp if both landed in the same millisecond
+        // tick (this bit a first version of this fix in testing — a
+        // pre-existing stale record from just before a burst started
+        // was mistaken for "refreshed while we waited" purely from
+        // clock-tick coincidence, serving stale data instead of
+        // running the live lookup the request actually needed). When
+        // timestamps tie, the safe default is to run our own lookup —
+        // worst case that's one redundant lookup, never a stale
+        // result served as if it were fresh.
+        const refreshedWhileWeWaited =
+            maxAgeMs <= 0 &&
+            reCheckRecord &&
+            typeof reCheckRecord.fetchedAt === "number" &&
+            reCheckRecord.fetchedAt > requestArrivedAt;
+
+        if (freshByPolicy || refreshedWhileWeWaited) {
             const ageMs = Date.now() - reCheckRecord.fetchedAt;
             logger.info(
                 `[Taxpayer Cache] HIT for ${gstin} on re-check inside the queue ` +
-                `(age=${ageMs}ms) — a request ahead of us already refreshed it. ` +
-                "No browser lookup needed."
+                `(age=${ageMs}ms${refreshedWhileWeWaited ? ", force-refresh burst dedup" : ""}) — ` +
+                "a request ahead of us already refreshed it. No browser lookup needed."
             );
             return { data: reCheckRecord.data, cacheStatus: "HIT" };
         }

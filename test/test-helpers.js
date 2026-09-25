@@ -26,6 +26,22 @@ function test(name, fn) {
 }
 
 async function runTests() {
+    // A test file that registers zero tests (e.g. a typo in a `test(`
+    // call, or a file that threw before reaching any of them) would
+    // otherwise fall straight to the "0/0 passed" branch below and
+    // exit 0 — a silent false positive that test/run-all.js has no
+    // way to tell apart from a genuinely all-passing file. Found
+    // during the pre-deployment audit; dormant until now (every test
+    // file so far has always registered at least one test), but worth
+    // closing before this suite is trusted for CI.
+    if (tests.length === 0) {
+        console.log("  \x1b[31m✖ No tests were registered in this file.\x1b[0m");
+        console.log("");
+        console.log("\x1b[31m0/0 passed — treating an empty test file as a failure, not a pass.\x1b[0m");
+        process.exitCode = 1;
+        return;
+    }
+
     let failed = 0;
 
     for (const { name, fn } of tests) {

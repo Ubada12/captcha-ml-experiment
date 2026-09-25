@@ -66,6 +66,23 @@ test("POST /api/taxpayer with a malformed GSTIN is rejected with 400 before ever
     assert.equal(response.status, 400);
 });
 
+test("POST /api/taxpayer with an invalid maxCacheAgeMs is rejected with 400, listing the problem", async () => {
+    // A syntactically valid GSTIN here on purpose — this proves the
+    // rejection comes from maxCacheAgeMs validation specifically, not
+    // as a side effect of the gstin check above. Since validation
+    // runs (and fails) before getOrRefreshTaxpayer is ever called,
+    // this never reaches the real pipeline/browser — same as the
+    // malformed-GSTIN case above.
+    const response = await fetch(`${baseUrl}/api/taxpayer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-API-Key": "test-api-key-123" },
+        body: JSON.stringify({ gstin: "27ABCDE1234F1Z5", maxCacheAgeMs: -1 })
+    });
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.ok(Array.isArray(body.details) && body.details.some(message => message.includes("maxCacheAgeMs")));
+});
+
 test("GET /api/taxpayer/:gstin/cached with a valid but never-looked-up GSTIN returns 404", async () => {
     const response = await fetch(`${baseUrl}/api/taxpayer/29ZZZZZ0000Z1Z0/cached`, {
         headers: { "X-API-Key": "test-api-key-123" }
